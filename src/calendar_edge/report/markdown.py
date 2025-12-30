@@ -7,6 +7,7 @@ from pathlib import Path
 
 from calendar_edge.config import DB_PATH, PROJECT_ROOT, TEST_START, TRAIN_END
 from calendar_edge.db import PricesRepo, ReturnsRepo, SignalsRepo
+from calendar_edge.features import build_future_calendar_keys
 
 logger = logging.getLogger("calendar_edge")
 
@@ -150,42 +151,47 @@ def generate_markdown_report(
                 )
         lines.append("")
 
-    # Forward calendar
-    lines.append(f"## Forward Calendar (Next {next_days} Days)")
+    # Forward calendar using NYSE trading calendar
+    lines.append(f"## Forward Calendar (Next {next_days} Calendar Days)")
+    lines.append("")
+    lines.append("*Uses NYSE trading calendar - excludes weekends and market holidays.*")
     lines.append("")
 
     today = datetime.now().date()
-    forward_dates = [(today + timedelta(days=i)) for i in range(next_days)]
+    end_date = today + timedelta(days=next_days)
+
+    # Build future calendar keys using trading calendar
+    future_keys = build_future_calendar_keys(today, end_date)
 
     # Get all eligible signals
     all_signals = signals_repo.get_signal_stats(run_id, "train", eligible_only=True)
 
-    if not all_signals.empty:
-        lines.append("| Date | DOW | Signals |")
-        lines.append("|------|-----|---------|")
+    if not all_signals.empty and not future_keys.empty:
+        lines.append("| Date | DOW | Family | Signal | Symbol | Direction |")
+        lines.append("|------|-----|--------|--------|--------|-----------|")
 
-        for fd in forward_dates:
-            month = fd.month
-            day = fd.day
-            dow_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-            dow = dow_names[fd.weekday()]
+        dow_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
-            # Skip weekends
-            if fd.weekday() >= 5:
-                continue
+        for _, key_row in future_keys.iterrows():
+            date_str = key_row["date"]
+            month = int(key_row["month"])
+            day = int(key_row["day"])
+            tdom = int(key_row["tdom"])
+            dow = dow_names[int(key_row["dow"])]
 
-            # Find matching CDOY signals
-            matches = []
+            # Find matching signals (both CDOY and TDOM)
             for _, row in all_signals.iterrows():
                 key_dict = json.loads(row["key_json"]) if isinstance(row["key_json"], str) else row["key_json"]
                 family = row["family"]
 
                 if family == "CDOY":
                     if key_dict.get("month") == month and key_dict.get("day") == day:
-                        matches.append(f"{row['symbol']}:{row['direction']}")
-
-            if matches:
-                lines.append(f"| {fd.strftime('%Y-%m-%d')} | {dow} | {', '.join(matches)} |")
+                        signal_name = f"M{month:02d}D{day:02d}"
+                        lines.append(f"| {date_str} | {dow} | CDOY | {signal_name} | {row['symbol']} | {row['direction']} |")
+                elif family == "TDOM":
+                    if key_dict.get("tdom") == tdom:
+                        signal_name = f"TDOM{tdom}"
+                        lines.append(f"| {date_str} | {dow} | TDOM | {signal_name} | {row['symbol']} | {row['direction']} |")
 
         lines.append("")
     else:

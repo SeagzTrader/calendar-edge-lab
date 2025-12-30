@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from calendar_edge.config import DB_PATH, FDR_THRESHOLD, MIN_N, TEST_START, TRAIN_END
 from calendar_edge.db import CalendarKeysRepo, PricesRepo, ReturnsRepo, RunsRepo, SignalsRepo
+from calendar_edge.features import build_future_calendar_keys
 
 # Friendly symbol names
 SYMBOL_NAMES = {
@@ -471,32 +472,15 @@ def render_signal_detail(run_id: str):
         st.warning(f"This signal does not pass eligibility criteria (requires n >= {MIN_N} and FDR-Q <= {FDR_THRESHOLD:.0%})")
 
 
-def compute_tdom_for_date(target_date: datetime) -> int:
-    """Compute trading day of month for a given date.
-
-    Assumes weekdays (Mon-Fri) are trading days. This is approximate
-    but works for most cases. Holidays are not accounted for.
-    """
-    # Count weekdays from start of month to this date
-    year = target_date.year
-    month = target_date.month
-    tdom = 0
-    for day in range(1, target_date.day + 1):
-        d = datetime(year, month, day)
-        if d.weekday() < 5:  # Monday=0 to Friday=4
-            tdom += 1
-    return tdom
-
-
 def render_forward_calendar(run_id: str):
     """Render forward calendar page.
 
     Shows upcoming dates where eligible signals fire.
     Includes BOTH CDOY and TDOM signals.
-    Computes TDOM for future dates using weekday heuristic.
+    Uses NYSE trading calendar (exchange-calendars) for accurate session dates.
     """
     st.header("Forward Calendar")
-    st.caption("Upcoming dates where eligible Train signals fire. Includes both CDOY (calendar day) and TDOM (trading day) signals.")
+    st.caption("Upcoming trading sessions where eligible Train signals fire. Uses NYSE calendar (holidays excluded).")
 
     signals_repo = SignalsRepo()
     prices_repo = PricesRepo()
@@ -513,7 +497,7 @@ def render_forward_calendar(run_id: str):
             format_func=format_symbol,
         )
     with col2:
-        num_days = st.slider("Days Ahead", 30, 180, 60)
+        num_days = st.slider("Calendar Days Ahead", 30, 180, 60)
 
     if not selected_symbols:
         st.warning("Please select at least one symbol.")
@@ -541,26 +525,26 @@ def render_forward_calendar(run_id: str):
     for _, row in test_stats.iterrows():
         test_wr_map[row["signal_id"]] = row["win_rate"]
 
-    # Generate future dates and compute TDOM for each
+    # Build future calendar keys using NYSE trading calendar
     today = datetime.now().date()
+    end_date = today + timedelta(days=num_days)
+
+    future_keys = build_future_calendar_keys(today, end_date)
+
+    if future_keys.empty:
+        st.warning("No trading sessions found in the selected date range.")
+        return
 
     # Build forward calendar data
     calendar_data = []
+    dow_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
-    for i in range(num_days):
-        fd = today + timedelta(days=i)
-
-        # Skip weekends (not trading days)
-        if fd.weekday() >= 5:
-            continue
-
-        month = fd.month
-        day = fd.day
-        tdom = compute_tdom_for_date(datetime(fd.year, fd.month, fd.day))
-
-        dow_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-        dow = dow_names[fd.weekday()]
-        date_str = fd.strftime("%Y-%m-%d")
+    for _, key_row in future_keys.iterrows():
+        date_str = key_row["date"]
+        month = int(key_row["month"])
+        day = int(key_row["day"])
+        tdom = int(key_row["tdom"])
+        dow = dow_names[int(key_row["dow"])]
 
         # Check each symbol's signals
         for symbol in selected_symbols:
@@ -606,17 +590,17 @@ def render_forward_calendar(run_id: str):
 
         # Summary stats
         st.markdown("---")
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.metric("Total Signal Events", len(calendar_data))
+            st.metric("Trading Sessions", len(future_keys))
         with col2:
+            st.metric("Total Signal Events", len(calendar_data))
+        with col3:
             cdoy_count = len([c for c in calendar_data if c["Family"] == "CDOY"])
             st.metric("CDOY Events", cdoy_count)
-        with col3:
+        with col4:
             tdom_count = len([c for c in calendar_data if c["Family"] == "TDOM"])
             st.metric("TDOM Events", tdom_count)
-
-        st.caption("Note: TDOM is computed assuming weekdays are trading days. Market holidays are not accounted for.")
     else:
         st.info("No eligible signals fire in the selected date range.")
 
