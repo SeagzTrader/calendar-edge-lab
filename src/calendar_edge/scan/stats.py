@@ -33,6 +33,8 @@ def compute_stats(
             "ci_low": None,
             "ci_high": None,
             "p_value": None,
+            "avg_win": None,
+            "avg_loss": None,
         }
 
     wins = int(returns_df["up"].sum())
@@ -56,6 +58,13 @@ def compute_stats(
     else:
         p_value = None
 
+    # Avg win/loss for context
+    win_mask = returns_df["up"] == 1
+    loss_mask = returns_df["up"] == 0
+
+    avg_win = float(returns_df.loc[win_mask, "ret_cc"].mean()) if win_mask.any() else None
+    avg_loss = float(returns_df.loc[loss_mask, "ret_cc"].mean()) if loss_mask.any() else None
+
     return {
         "n": n,
         "wins": wins,
@@ -65,6 +74,8 @@ def compute_stats(
         "ci_low": ci_low,
         "ci_high": ci_high,
         "p_value": p_value,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
     }
 
 

@@ -290,8 +290,9 @@ class SignalsRepo:
                 """
                 INSERT OR REPLACE INTO signal_stats
                 (run_id, signal_id, window, n, wins, win_rate, avg_ret, median_ret,
-                 ci_low, ci_high, p_value, fdr_q, decade_consistency, z_score, score, eligible)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ci_low, ci_high, p_value, fdr_q, decade_consistency, z_score, score, eligible,
+                 avg_win, avg_loss)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -310,6 +311,8 @@ class SignalsRepo:
                     stats.get("z_score"),
                     stats.get("score"),
                     stats.get("eligible", 1),
+                    stats.get("avg_win"),
+                    stats.get("avg_loss"),
                 ),
             )
             conn.commit()
@@ -340,7 +343,8 @@ class SignalsRepo:
             SELECT s.signal_id, s.run_id, s.symbol, s.family, s.direction, s.key_json,
                    ss.window, ss.n, ss.wins, ss.win_rate, ss.avg_ret, ss.median_ret,
                    ss.ci_low, ss.ci_high, ss.p_value, ss.fdr_q, ss.decade_consistency,
-                   ss.z_score, ss.score, ss.eligible
+                   ss.z_score, ss.score, ss.eligible,
+                   ss.avg_win, ss.avg_loss
             FROM signals s
             JOIN signal_stats ss ON s.signal_id = ss.signal_id AND s.run_id = ss.run_id
             WHERE s.run_id = ?
@@ -371,7 +375,8 @@ class SignalsRepo:
             SELECT s.signal_id, s.run_id, s.symbol, s.family, s.direction, s.key_json,
                    ss.window, ss.n, ss.wins, ss.win_rate, ss.avg_ret, ss.median_ret,
                    ss.ci_low, ss.ci_high, ss.p_value, ss.fdr_q, ss.decade_consistency,
-                   ss.z_score, ss.score, ss.eligible
+                   ss.z_score, ss.score, ss.eligible,
+                   ss.avg_win, ss.avg_loss
             FROM signals s
             JOIN signal_stats ss ON s.signal_id = ss.signal_id AND s.run_id = ss.run_id
             WHERE s.run_id = ? AND ss.window = ? AND ss.eligible = 1

@@ -219,6 +219,20 @@ class WalkForwardValidator:
                 self.run_id, signal_id, "full", full_stats
             )
 
+            # Decade stats (for UI breakdown)
+            decade_stats = self._compute_decade_stats(
+                keys_df[keys_df["date"] <= TRAIN_END],
+                returns_df[returns_df["date"] <= TRAIN_END],
+                sig["key"],
+                sig["family"],
+                train_baseline,
+                sig["direction"],
+            )
+            for decade, stats in decade_stats.items():
+                self.signals_repo.insert_signal_stats(
+                    self.run_id, signal_id, f"decade_{decade}s", stats
+                )
+
     def _get_returns_for_key(
         self,
         keys_df: pd.DataFrame,
@@ -281,5 +295,40 @@ class WalkForwardValidator:
 
             delta = s - bs
             result[str(decade)] = delta
+
+        return result
+
+    def _compute_decade_stats(
+        self,
+        keys_df: pd.DataFrame,
+        returns_df: pd.DataFrame,
+        key: dict,
+        family: str,
+        baseline: float,
+        direction: str,
+    ) -> dict[str, dict]:
+        """Compute full stats for each decade."""
+        # Extract years
+        returns_df = returns_df.copy()
+        returns_df["year"] = pd.to_datetime(returns_df["date"]).dt.year
+        returns_df["decade"] = (returns_df["year"] // 10) * 10
+
+        keys_df = keys_df.copy()
+        keys_df["year"] = pd.to_datetime(keys_df["date"]).dt.year
+        keys_df["decade"] = (keys_df["year"] // 10) * 10
+
+        result = {}
+
+        for decade in sorted(keys_df["decade"].unique()):
+            decade_keys = keys_df[keys_df["decade"] == decade]
+            decade_returns = returns_df[returns_df["decade"] == decade]
+
+            subset = self._get_returns_for_key(decade_keys, decade_returns, key, family)
+
+            if len(subset) < MIN_DECADE_N:
+                continue
+
+            stats = compute_stats(subset, baseline, direction)
+            result[str(decade)] = stats
 
         return result

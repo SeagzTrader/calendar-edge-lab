@@ -69,3 +69,26 @@ def init_db(db_path: Path | None = None) -> None:
         conn.executescript(schema)
         conn.commit()
         logger.info(f"Database initialized at {path}")
+
+    # Run migrations for existing databases
+    _run_migrations(path)
+
+
+def _run_migrations(db_path: Path) -> None:
+    """Run migrations to update schema for existing databases."""
+    with conn_ctx(db_path) as conn:
+        cursor = conn.cursor()
+
+        # Check if signal_stats table has new columns
+        cursor.execute("PRAGMA table_info(signal_stats)")
+        columns = {row["name"] for row in cursor.fetchall()}
+
+        # Add avg_win/avg_loss columns if missing
+        if "avg_win" not in columns:
+            cursor.execute("ALTER TABLE signal_stats ADD COLUMN avg_win REAL")
+            logger.info("Added avg_win column to signal_stats")
+        if "avg_loss" not in columns:
+            cursor.execute("ALTER TABLE signal_stats ADD COLUMN avg_loss REAL")
+            logger.info("Added avg_loss column to signal_stats")
+
+        conn.commit()

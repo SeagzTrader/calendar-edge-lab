@@ -646,6 +646,16 @@ def render_home(run_id: str, show_internal_codes: bool = False):
                 else:
                     st.markdown("**Verification:** No data")
 
+                # Show avg return if available
+                train_avg_ret = row.get("avg_ret")
+                if train_avg_ret is not None:
+                    ret_pct = train_avg_ret * 100
+                    st.caption(f"Avg return: {ret_pct:+.2f}%")
+
+                    # Warning for negative avg return despite high win rate
+                    if train_avg_ret < 0:
+                        st.warning("⚠️ Negative avg return")
+
                 # Held up badge
                 st.markdown(f"{held_icon} **{held_label}**")
 
@@ -1088,6 +1098,58 @@ def render_signal_detail(run_id: str, show_internal_codes: bool = False):
             st.caption("Pattern did not persist in verification")
         else:
             st.caption("Insufficient verification data")
+
+    # Decade breakdown section
+    st.markdown("---")
+    st.markdown("### Decade Breakdown")
+    st.caption("Performance by decade during the discovery period (before 2010).")
+
+    # Get all window stats for this signal to find decade_* windows
+    all_window_stats = signals_repo.get_signal_stats(run_id)
+    signal_all_windows = all_window_stats[all_window_stats["signal_id"] == selected_signal]
+
+    # Filter to decade windows
+    decade_rows = signal_all_windows[signal_all_windows["window"].str.startswith("decade_")]
+
+    if decade_rows.empty:
+        st.info("No decade breakdown available. Re-run scan to generate.")
+    else:
+        decade_data = []
+        decades_with_edge = 0
+        total_decades = 0
+
+        for _, row in decade_rows.iterrows():
+            window = row["window"]  # e.g., "decade_1950s"
+            decade_label = window.replace("decade_", "").replace("s", "s")  # "1950s"
+
+            win_rate = row["win_rate"]
+            n = row["n"]
+            delta = win_rate - train_baseline_wr
+
+            # Checkmark if win rate > baseline
+            if delta > 0:
+                status = "✅"
+                decades_with_edge += 1
+            else:
+                status = "—"
+
+            total_decades += 1
+
+            decade_data.append({
+                "Decade": decade_label,
+                "Hit Rate": f"{win_rate:.1%}",
+                "vs Baseline": f"{delta:+.1%}",
+                "N": n,
+                "Edge": status,
+            })
+
+        # Sort by decade
+        decade_data.sort(key=lambda x: x["Decade"])
+
+        # Summary
+        st.markdown(f"**{decades_with_edge} of {total_decades}** decades showed positive edge.")
+
+        st.dataframe(pd.DataFrame(decade_data), use_container_width=True, hide_index=True)
 
     # Eligibility status
     st.markdown("---")

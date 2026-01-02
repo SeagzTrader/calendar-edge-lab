@@ -65,6 +65,8 @@ CREATE TABLE IF NOT EXISTS signal_stats (
     z_score REAL,
     score REAL,
     eligible INTEGER DEFAULT 1,
+    avg_win REAL,
+    avg_loss REAL,
     PRIMARY KEY (run_id, signal_id, window),
     FOREIGN KEY (run_id) REFERENCES runs(run_id),
     FOREIGN KEY (signal_id) REFERENCES signals(signal_id)
