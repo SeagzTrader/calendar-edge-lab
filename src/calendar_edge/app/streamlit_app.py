@@ -360,6 +360,96 @@ def get_validated_patterns(train_stats, test_stats, baselines, include_not_held=
     return pd.DataFrame(patterns)
 
 
+def get_patterns_all_tiers(train_stats, test_stats, baselines):
+    """Get patterns from all evidence tiers with tier classification.
+
+    Returns patterns that meet any tier criteria:
+    - Validated: q <= 0.10
+    - Promising: 0.10 < q <= 0.20
+    - Exploratory: p <= 0.05 (and q > 0.20 or q is null)
+    """
+    if train_stats is None or train_stats.empty:
+        return pd.DataFrame()
+
+    patterns = []
+
+    for _, row in train_stats.iterrows():
+        if row["n"] < MIN_N:
+            continue
+
+        q = row.get("fdr_q")
+        p = row.get("p_value")
+
+        # Determine tier
+        if q is not None and q <= FDR_VALIDATED:
+            tier = "Validated"
+        elif q is not None and q <= FDR_PROMISING:
+            tier = "Promising"
+        elif p is not None and p <= P_EXPLORATORY:
+            tier = "Exploratory"
+        else:
+            continue  # Does not meet any tier criteria
+
+        signal_id = row["signal_id"]
+        symbol = row["symbol"]
+        family = row["family"]
+        direction = row["direction"]
+        key = json.loads(row["key_json"]) if isinstance(row["key_json"], str) else row["key_json"]
+
+        train_baseline = baselines.get(symbol, {}).get("train", 0.5)
+        test_baseline = baselines.get(symbol, {}).get("test", 0.5)
+
+        # Get test stats
+        test_row = test_stats[test_stats["signal_id"] == signal_id] if test_stats is not None else None
+        if test_row is not None and not test_row.empty:
+            test_data = test_row.iloc[0]
+            test_wr = float(test_data["win_rate"])
+            test_n = int(test_data["n"])
+        else:
+            test_wr = None
+            test_n = None
+
+        is_validated = compute_held_up_status(
+            row["win_rate"], train_baseline, test_wr, test_baseline, test_n
+        )
+
+        # Badge based on tier
+        if tier == "Validated":
+            if is_validated:
+                badge_text, badge_hex = "VALIDATED", COLORS["badge_green"]
+            else:
+                badge_text, badge_hex = "DID NOT HOLD", COLORS["badge_red"]
+        elif tier == "Promising":
+            badge_text, badge_hex = "PROMISING", COLORS["badge_orange"]
+        else:
+            badge_text, badge_hex = "EXPLORATORY", COLORS["badge_gray"]
+
+        patterns.append({
+            "signal_id": signal_id,
+            "symbol": symbol,
+            "family": family,
+            "direction": direction,
+            "key": key,
+            "pattern_name": format_pattern_name(family, key),
+            "internal_code": get_internal_code(family, key),
+            "train_wr": row["win_rate"],
+            "train_n": row["n"],
+            "train_baseline": train_baseline,
+            "test_wr": test_wr,
+            "test_n": test_n,
+            "test_baseline": test_baseline,
+            "avg_ret": row.get("avg_ret"),
+            "p_value": p,
+            "fdr_q": q,
+            "tier": tier,
+            "is_validated": is_validated,
+            "badge_text": badge_text,
+            "badge_hex": badge_hex,
+        })
+
+    return pd.DataFrame(patterns)
+
+
 # =============================================================================
 # Page: Overview
 # =============================================================================
@@ -495,24 +585,57 @@ def render_upcoming():
     prices_repo = PricesRepo()
     symbols = prices_repo.get_symbols()
 
-    # Filter chips for indices
-    selected_symbols = st.multiselect(
-        "Filter by Index",
-        symbols,
-        default=symbols,
-        format_func=format_symbol,
-    )
+    # Controls row: Index filter and tier toggles
+    col1, col2, col3, col4 = st.columns([3, 1, 1, 1])
+
+    with col1:
+        selected_symbols = st.multiselect(
+            "Filter by Index",
+            symbols,
+            default=symbols,
+            format_func=format_symbol,
+        )
+
+    with col2:
+        show_validated = st.checkbox("Validated", value=True)
+
+    with col3:
+        show_promising = st.checkbox("Promising", value=True)
+
+    with col4:
+        show_exploratory = st.checkbox("Exploratory", value=False)
 
     if not selected_symbols:
         st.info("Select at least one index.")
         return
 
-    # Get validated patterns
-    all_patterns = get_validated_patterns(train_stats, test_stats, baselines, include_not_held=False)
+    # Get all patterns with tier classification
+    all_patterns = get_patterns_all_tiers(train_stats, test_stats, baselines)
+
+    if all_patterns.empty:
+        st.info("No patterns found.")
+        return
+
+    # Filter by selected symbols
     filtered_patterns = all_patterns[all_patterns["symbol"].isin(selected_symbols)]
 
+    # Filter by selected tiers
+    selected_tiers = []
+    if show_validated:
+        selected_tiers.append("Validated")
+    if show_promising:
+        selected_tiers.append("Promising")
+    if show_exploratory:
+        selected_tiers.append("Exploratory")
+
+    if not selected_tiers:
+        st.info("Select at least one evidence tier.")
+        return
+
+    filtered_patterns = filtered_patterns[filtered_patterns["tier"].isin(selected_tiers)]
+
     if filtered_patterns.empty:
-        st.info("No validated patterns for selected indices.")
+        st.info("No patterns match the selected filters.")
         return
 
     # Load future calendar
@@ -548,11 +671,12 @@ def render_upcoming():
                 "train_wr": p["train_wr"],
                 "train_baseline": p["train_baseline"],
                 "test_wr": p["test_wr"],
+                "tier": p["tier"],
                 "signal_id": p["signal_id"],
             })
 
     if not events:
-        st.info("No upcoming events for validated patterns in the next 90 days.")
+        st.info("No upcoming events for selected patterns in the next 90 days.")
         return
 
     events_df = pd.DataFrame(events)
