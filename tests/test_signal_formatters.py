@@ -1,23 +1,18 @@
-"""Tests for signal key formatter functions."""
+"""Tests for UI component functions."""
 
-
-# Import formatters from streamlit app
 import sys
 from pathlib import Path
 
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from calendar_edge.app.streamlit_app import (
-    describe_direction,
-    describe_pattern_key,
-    describe_signal_key,
-    format_short_date,
-    format_signal_key,
-    get_held_up_label,
+from calendar_edge.app.ui.components import (
+    format_date_human,
+    format_pattern_name,
+    get_badge,
+    get_direction_label,
     get_internal_code,
     ordinal,
-    parse_internal_code,
 )
 
 
@@ -73,178 +68,120 @@ class TestGetInternalCode:
         assert get_internal_code("CDOY", {"month": 3, "day": 5}) == "M03D05"
 
 
-class TestFormatSignalKey:
-    """Tests for format_signal_key function."""
+class TestFormatPatternName:
+    """Tests for format_pattern_name function."""
 
     def test_tdom1_human_label(self):
-        result = format_signal_key("TDOM", {"tdom": 1})
-        assert result == "1st trading day of month"
+        result = format_pattern_name("TDOM", {"tdom": 1})
+        assert result == "1st Trading Day of Month"
 
     def test_tdom2_human_label(self):
-        result = format_signal_key("TDOM", {"tdom": 2})
-        assert result == "2nd trading day of month"
+        result = format_pattern_name("TDOM", {"tdom": 2})
+        assert result == "2nd Trading Day of Month"
 
     def test_tdom10_human_label(self):
-        result = format_signal_key("TDOM", {"tdom": 10})
-        assert result == "10th trading day of month"
+        result = format_pattern_name("TDOM", {"tdom": 10})
+        assert result == "10th Trading Day of Month"
 
     def test_cdoy_jan_2(self):
-        result = format_signal_key("CDOY", {"month": 1, "day": 2})
+        result = format_pattern_name("CDOY", {"month": 1, "day": 2})
         assert result == "Jan 2"
 
     def test_cdoy_dec_26(self):
-        result = format_signal_key("CDOY", {"month": 12, "day": 26})
+        result = format_pattern_name("CDOY", {"month": 12, "day": 26})
         assert result == "Dec 26"
 
     def test_cdoy_mar_15(self):
-        result = format_signal_key("CDOY", {"month": 3, "day": 15})
+        result = format_pattern_name("CDOY", {"month": 3, "day": 15})
         assert result == "Mar 15"
 
 
-class TestDescribeSignalKey:
-    """Tests for describe_signal_key function."""
-
-    def test_up_direction(self):
-        result = describe_signal_key("TDOM", {"tdom": 1}, "UP")
-        assert "up" in result.lower()
-        assert "close" in result.lower()
-
-    def test_down_direction(self):
-        result = describe_signal_key("CDOY", {"month": 12, "day": 26}, "DOWN")
-        assert "down" in result.lower()
-        assert "close" in result.lower()
-
-
-class TestParseInternalCode:
-    """Tests for parse_internal_code function."""
-
-    def test_parse_tdom1(self):
-        result = parse_internal_code("TDOM1")
-        assert result == ("TDOM", {"tdom": 1})
-
-    def test_parse_tdom10(self):
-        result = parse_internal_code("TDOM10")
-        assert result == ("TDOM", {"tdom": 10})
-
-    def test_parse_tdom22(self):
-        result = parse_internal_code("TDOM22")
-        assert result == ("TDOM", {"tdom": 22})
-
-    def test_parse_cdoy_m01d02(self):
-        result = parse_internal_code("M01D02")
-        assert result == ("CDOY", {"month": 1, "day": 2})
-
-    def test_parse_cdoy_m12d26(self):
-        result = parse_internal_code("M12D26")
-        assert result == ("CDOY", {"month": 12, "day": 26})
-
-    def test_parse_cdoy_m3d5(self):
-        """Single digit month/day should also work."""
-        result = parse_internal_code("M3D5")
-        assert result == ("CDOY", {"month": 3, "day": 5})
-
-    def test_parse_invalid_returns_none(self):
-        assert parse_internal_code("INVALID") is None
-        assert parse_internal_code("") is None
-        assert parse_internal_code("XYZ123") is None
-
-    def test_parse_lowercase_invalid(self):
-        """Parsing is case-sensitive."""
-        assert parse_internal_code("tdom1") is None
-        assert parse_internal_code("m01d02") is None
-
-
-class TestRoundTrip:
-    """Tests that internal codes can be parsed back correctly."""
-
-    def test_tdom_roundtrip(self):
-        """TDOM codes should roundtrip through get_internal_code and parse_internal_code."""
-        for tdom in [1, 2, 5, 10, 22]:
-            key = {"tdom": tdom}
-            code = get_internal_code("TDOM", key)
-            parsed = parse_internal_code(code)
-            assert parsed == ("TDOM", key)
-
-    def test_cdoy_roundtrip(self):
-        """CDOY codes should roundtrip through get_internal_code and parse_internal_code."""
-        test_cases = [
-            {"month": 1, "day": 2},
-            {"month": 12, "day": 26},
-            {"month": 3, "day": 15},
-            {"month": 7, "day": 4},
-        ]
-        for key in test_cases:
-            code = get_internal_code("CDOY", key)
-            parsed = parse_internal_code(code)
-            assert parsed == ("CDOY", key)
-
-
-class TestDescribePatternKey:
-    """Tests for describe_pattern_key function."""
-
-    def test_tdom1(self):
-        result = describe_pattern_key("TDOM1")
-        assert result == "1st trading day of month"
-
-    def test_tdom10(self):
-        result = describe_pattern_key("TDOM10")
-        assert result == "10th trading day of month"
-
-    def test_cdoy_m12d26(self):
-        result = describe_pattern_key("M12D26")
-        assert result == "Dec 26"
-
-    def test_cdoy_m01d02(self):
-        result = describe_pattern_key("M01D02")
-        assert result == "Jan 2"
-
-    def test_invalid_returns_original(self):
-        result = describe_pattern_key("INVALID")
-        assert result == "INVALID"
-
-
-class TestDescribeDirection:
-    """Tests for describe_direction function."""
+class TestGetDirectionLabel:
+    """Tests for get_direction_label function."""
 
     def test_up(self):
-        assert describe_direction("UP") == "Up day"
+        assert get_direction_label("UP") == "Closes Higher"
 
     def test_down(self):
-        assert describe_direction("DOWN") == "Down day"
+        assert get_direction_label("DOWN") == "Closes Lower"
 
     def test_unknown_returns_original(self):
-        assert describe_direction("SIDEWAYS") == "SIDEWAYS"
+        assert get_direction_label("SIDEWAYS") == "SIDEWAYS"
 
 
-class TestFormatShortDate:
-    """Tests for format_short_date function."""
+class TestFormatDateHuman:
+    """Tests for format_date_human function."""
 
-    def test_already_short(self):
-        assert format_short_date("2026-01-02") == "2026-01-02"
+    def test_standard_date(self):
+        assert format_date_human("2026-01-02") == "Jan 2, 2026"
 
-    def test_handles_string(self):
-        assert format_short_date("2026-12-26") == "2026-12-26"
+    def test_december_date(self):
+        assert format_date_human("2026-12-26") == "Dec 26, 2026"
+
+    def test_empty_returns_empty(self):
+        assert format_date_human("") == ""
 
 
-class TestGetHeldUpLabel:
-    """Tests for get_held_up_label function."""
+class TestGetBadge:
+    """Tests for get_badge function."""
 
-    def test_yes(self):
-        icon, label = get_held_up_label("yes")
-        assert icon == "✅"
-        assert label == "Held up"
+    def test_robust_edge(self):
+        """High expectancy + high decade consistency = ROBUST EDGE."""
+        badge, color, _ = get_badge(
+            is_validated=True,
+            avg_ret=0.001,  # > 0.0005
+            decade_consistency=0.85,  # >= 0.8
+            win_rate=0.60,
+            baseline=0.52,
+        )
+        assert badge == "ROBUST EDGE"
+        assert color == "green"
 
-    def test_unclear(self):
-        icon, label = get_held_up_label("unclear")
-        assert icon == "⚠️"
-        assert label == "Unclear"
+    def test_negative_expectancy(self):
+        """High win rate but negative avg_ret = NEG EXPECTANCY."""
+        badge, color, _ = get_badge(
+            is_validated=True,
+            avg_ret=-0.001,  # negative
+            decade_consistency=0.5,
+            win_rate=0.60,  # > baseline + 0.05
+            baseline=0.52,
+        )
+        assert badge == "NEG EXPECTANCY"
+        assert color == "orange"
 
-    def test_no(self):
-        icon, label = get_held_up_label("no")
-        assert icon == "❌"
-        assert label == "Did not hold"
+    def test_did_not_hold(self):
+        """Not validated = DID NOT HOLD."""
+        badge, color, _ = get_badge(
+            is_validated=False,
+            avg_ret=0.001,
+            decade_consistency=0.85,
+            win_rate=0.60,
+            baseline=0.52,
+        )
+        assert badge == "DID NOT HOLD"
+        assert color == "red"
 
-    def test_unknown(self):
-        icon, label = get_held_up_label("unknown")
-        assert icon == "❓"
-        assert label == "No test data"
+    def test_statistical_pattern(self):
+        """Validated but not robust = STATISTICAL PATTERN."""
+        badge, color, _ = get_badge(
+            is_validated=True,
+            avg_ret=0.0003,  # < 0.0005
+            decade_consistency=0.6,  # < 0.8
+            win_rate=0.55,
+            baseline=0.52,
+        )
+        assert badge == "STATISTICAL PATTERN"
+        assert color == "gray"
+
+    def test_negative_expectancy_takes_priority(self):
+        """NEG EXPECTANCY should take priority over DID NOT HOLD."""
+        badge, color, _ = get_badge(
+            is_validated=False,
+            avg_ret=-0.001,
+            decade_consistency=0.85,
+            win_rate=0.60,  # > baseline + 0.05
+            baseline=0.52,
+        )
+        # NEG EXPECTANCY check happens first
+        assert badge == "NEG EXPECTANCY"
+        assert color == "orange"

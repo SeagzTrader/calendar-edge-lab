@@ -19,8 +19,13 @@ MIN_DECADE_N = 8
 TRAIN_END = "2009-12-31"
 TEST_START = "2010-01-01"
 
-# FDR
-FDR_THRESHOLD = 0.10
+# FDR thresholds for evidence tiers
+FDR_VALIDATED = 0.10  # Tier 1: Validated (q <= 0.10)
+FDR_PROMISING = 0.20  # Tier 2: Promising (0.10 < q <= 0.20)
+P_EXPLORATORY = 0.05  # Tier 3: Exploratory (raw p <= 0.05)
+
+# Legacy alias
+FDR_THRESHOLD = FDR_VALIDATED
 
 # Logging
 LOG_LEVEL = "INFO"
