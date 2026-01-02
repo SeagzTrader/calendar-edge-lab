@@ -141,6 +141,21 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_validate(args: argparse.Namespace) -> int:
+    """Run validation checks on the database."""
+    from calendar_edge.validation import format_results, run_all_checks
+
+    print("Running validation checks...")
+    print()
+
+    results = run_all_checks()
+    print(format_results(results))
+
+    # Return exit code based on failures
+    failed = sum(1 for r in results if not r.passed)
+    return 1 if failed > 0 else 0
+
+
 def main() -> int:
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -188,6 +203,10 @@ def main() -> int:
         help="Number of days for forward calendar (default: 60)",
     )
     report_parser.set_defaults(func=cmd_report)
+
+    # validate
+    validate_parser = subparsers.add_parser("validate", help="Run validation checks")
+    validate_parser.set_defaults(func=cmd_validate)
 
     args = parser.parse_args()
 

@@ -12,9 +12,68 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from calendar_edge.config import DB_PATH, FDR_THRESHOLD, MIN_N, TEST_START, TRAIN_END
+from calendar_edge.config import DB_PATH, TEST_START, TRAIN_END
 from calendar_edge.db import CalendarKeysRepo, PricesRepo, ReturnsRepo, RunsRepo, SignalsRepo
 from calendar_edge.features import build_future_calendar_keys
+from calendar_edge.validation import run_all_checks
+
+
+def get_check_status(r) -> str:
+    """Get status from CheckResult, supporting both old and new formats.
+
+    Handles:
+    - dataclass with .status (new)
+    - dataclass with .passed bool (old)
+    - dict with keys {"status": ...} or {"passed": ...}
+    """
+    # New format: has .status attribute
+    if hasattr(r, "status"):
+        return r.status
+    # Dict with status key
+    if isinstance(r, dict) and "status" in r:
+        return r["status"]
+    # Old format: has .passed bool
+    if hasattr(r, "passed"):
+        return "pass" if r.passed else "fail"
+    # Dict with passed key
+    if isinstance(r, dict) and "passed" in r:
+        return "pass" if r["passed"] else "fail"
+    # Default to fail
+    return "fail"
+
+
+def is_check_warning(r) -> bool:
+    """Check if result is a warning/skip status."""
+    status = get_check_status(r)
+    return status in ("warn", "skip")
+
+
+def get_check_message(r) -> str:
+    """Get message from CheckResult."""
+    if hasattr(r, "message"):
+        return r.message
+    if isinstance(r, dict) and "message" in r:
+        return r["message"]
+    return ""
+
+
+def get_check_name(r) -> str:
+    """Get name from CheckResult."""
+    if hasattr(r, "name"):
+        return r.name
+    if isinstance(r, dict) and "name" in r:
+        return r["name"]
+    return "unknown"
+
+
+def get_check_details(r) -> dict | None:
+    """Get details from CheckResult."""
+    if hasattr(r, "details"):
+        return r.details
+    if isinstance(r, dict) and "details" in r:
+        return r["details"]
+    return None
+
 
 # Friendly symbol names
 SYMBOL_NAMES = {
@@ -22,6 +81,253 @@ SYMBOL_NAMES = {
     "^DJI": "Dow Jones Industrial Average (^DJI)",
     "^IXIC": "Nasdaq Composite (^IXIC)",
 }
+
+# Short symbol names for sentences
+SYMBOL_SHORT_NAMES = {
+    "^GSPC": "the S&P 500",
+    "^DJI": "the Dow Jones",
+    "^IXIC": "the Nasdaq",
+}
+
+# Month names for plain-English descriptions
+MONTH_NAMES = [
+    "", "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December"
+]
+
+# Ordinal suffixes
+def ordinal(n: int) -> str:
+    """Return ordinal string for a number (1st, 2nd, 3rd, etc.)."""
+    if 11 <= n % 100 <= 13:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def get_pattern_description(family: str, key: dict, direction: str) -> str:
+    """Generate plain-English description of a pattern.
+
+    Examples:
+    - TDOM1 UP -> "The 1st trading day of each month tends to close higher."
+    - M12D26 DOWN -> "December 26th tends to close lower."
+    """
+    if family == "TDOM":
+        tdom = key.get("tdom", 0)
+        dir_word = "higher" if direction == "UP" else "lower"
+        return f"The {ordinal(tdom)} trading day of each month tends to close {dir_word}."
+    else:  # CDOY
+        month = key.get("month", 1)
+        day = key.get("day", 1)
+        month_name = MONTH_NAMES[month]
+        dir_word = "higher" if direction == "UP" else "lower"
+        return f"{month_name} {ordinal(day)} tends to close {dir_word}."
+
+
+def get_pattern_label(family: str, key: dict, direction: str) -> str:
+    """Generate short pattern label.
+
+    Examples:
+    - TDOM1 UP -> "TDOM1 UP"
+    - M12D26 DOWN -> "Dec 26 DOWN"
+    """
+    if family == "TDOM":
+        return f"TDOM{key.get('tdom')} {direction}"
+    else:  # CDOY
+        month = key.get("month", 1)
+        day = key.get("day", 1)
+        month_abbr = MONTH_NAMES[month][:3]
+        return f"{month_abbr} {day} {direction}"
+
+
+def get_held_up_badge(
+    _train_wr: float,  # Kept for potential future use
+    train_baseline: float,
+    test_wr: float | None,
+    test_baseline: float | None,
+    test_n: int | None,
+) -> tuple[str, str, str]:
+    """Determine 'Held up?' badge based on test performance.
+
+    Returns:
+        Tuple of (icon, label, explanation)
+    """
+    if test_wr is None or test_n is None or test_n == 0:
+        return ("❓", "No test data", "Not enough test data to evaluate.")
+
+    test_delta = test_wr - (test_baseline or train_baseline)
+
+    if test_delta > 0 and test_n >= 30:
+        return ("✅", "Yes", f"Test win rate beat baseline by {test_delta:.1%} (n={test_n})")
+    elif test_delta > 0 and test_n < 30:
+        return ("⚠️", "Maybe", f"Positive in test (+{test_delta:.1%}) but small sample (n={test_n})")
+    elif test_delta > -0.02:  # Within 2% of baseline
+        return ("⚠️", "Unclear", f"Test win rate near baseline ({test_delta:+.1%}, n={test_n})")
+    else:
+        return ("❌", "No", f"Test win rate below baseline ({test_delta:+.1%}, n={test_n})")
+
+
+def get_confidence_level(score: float | None) -> tuple[str, str]:
+    """Map train score to confidence level.
+
+    Returns:
+        Tuple of (level, color) - level is "High", "Medium", or "Low"
+    """
+    if score is None:
+        return ("Low", "gray")
+    if score >= 2.0:
+        return ("High", "green")
+    elif score >= 1.0:
+        return ("Medium", "orange")
+    else:
+        return ("Low", "gray")
+
+
+# =============================================================================
+# Signal Key Formatters
+# =============================================================================
+# These functions convert internal signal keys to human-readable labels.
+# Internal keys (TDOM1, M12D26) are stored in DB and remain unchanged.
+
+
+def get_internal_code(family: str, key: dict) -> str:
+    """Return the internal code string for a signal key.
+
+    Examples:
+        TDOM family, {"tdom": 1} -> "TDOM1"
+        CDOY family, {"month": 12, "day": 26} -> "M12D26"
+    """
+    if family == "TDOM":
+        return f"TDOM{key.get('tdom', 0)}"
+    else:  # CDOY
+        month = key.get("month", 1)
+        day = key.get("day", 1)
+        return f"M{month:02d}D{day:02d}"
+
+
+def format_signal_key(family: str, key: dict) -> str:
+    """Convert internal signal key to human-readable label.
+
+    Examples:
+        TDOM1 -> "1st trading day of month"
+        TDOM2 -> "2nd trading day of month"
+        M12D26 -> "Dec 26"
+        M01D02 -> "Jan 2"
+    """
+    if family == "TDOM":
+        tdom = key.get("tdom", 0)
+        return f"{ordinal(tdom)} trading day of month"
+    else:  # CDOY
+        month = key.get("month", 1)
+        day = key.get("day", 1)
+        month_abbr = MONTH_NAMES[month][:3]
+        return f"{month_abbr} {day}"
+
+
+def describe_signal_key(family: str, key: dict, direction: str) -> str:
+    """Generate plain-English sentence describing the signal.
+
+    Examples:
+        TDOM1 UP -> "Tends to close up on this day"
+        M12D26 DOWN -> "Tends to close down on this day"
+    """
+    dir_word = "up" if direction == "UP" else "down"
+    return f"Tends to close {dir_word} on this day"
+
+
+def describe_pattern_key(code: str) -> str:
+    """Convert internal key string to friendly label.
+
+    This is the main display helper for converting internal codes to
+    human-readable labels throughout the UI.
+
+    Examples:
+        "TDOM1" -> "1st trading day of month"
+        "TDOM10" -> "10th trading day of month"
+        "M12D26" -> "Dec 26"
+        "M01D02" -> "Jan 2"
+
+    Returns:
+        Friendly label string, or original code if parsing fails.
+    """
+    parsed = parse_internal_code(code)
+    if parsed is None:
+        return code
+    family, key = parsed
+    return format_signal_key(family, key)
+
+
+def describe_direction(direction: str) -> str:
+    """Convert UP/DOWN to friendly direction label.
+
+    Examples:
+        "UP" -> "Up day"
+        "DOWN" -> "Down day"
+    """
+    if direction == "UP":
+        return "Up day"
+    elif direction == "DOWN":
+        return "Down day"
+    return direction
+
+
+def format_short_date(date_str: str) -> str:
+    """Format date string to short format (YYYY-MM-DD).
+
+    Input can be various formats, output is always YYYY-MM-DD.
+    """
+    # If already in YYYY-MM-DD format, return as-is
+    if len(date_str) == 10 and date_str[4] == "-" and date_str[7] == "-":
+        return date_str
+    # Try to parse and reformat
+    try:
+        from datetime import datetime as dt
+        parsed = dt.strptime(date_str[:10], "%Y-%m-%d")
+        return parsed.strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        return date_str
+
+
+def parse_internal_code(code: str) -> tuple[str, dict] | None:
+    """Parse an internal code string back to family and key dict.
+
+    This is useful for unit testing and potential future use.
+
+    Examples:
+        "TDOM1" -> ("TDOM", {"tdom": 1})
+        "M12D26" -> ("CDOY", {"month": 12, "day": 26})
+
+    Returns:
+        Tuple of (family, key_dict) or None if parsing fails.
+    """
+    import re
+
+    # Try TDOM pattern
+    tdom_match = re.match(r"^TDOM(\d+)$", code)
+    if tdom_match:
+        return ("TDOM", {"tdom": int(tdom_match.group(1))})
+
+    # Try CDOY pattern (MxxDyy)
+    cdoy_match = re.match(r"^M(\d{1,2})D(\d{1,2})$", code)
+    if cdoy_match:
+        return ("CDOY", {"month": int(cdoy_match.group(1)), "day": int(cdoy_match.group(2))})
+
+    return None
+
+
+def get_held_up_label(status: str) -> tuple[str, str]:
+    """Get display label and icon for held-up status.
+
+    Returns:
+        Tuple of (icon, label) for display.
+    """
+    labels = {
+        "yes": ("✅", "Held up"),
+        "unclear": ("⚠️", "Unclear"),
+        "no": ("❌", "Did not hold"),
+        "unknown": ("❓", "No test data"),
+    }
+    return labels.get(status, ("❓", status))
 
 
 def format_symbol(symbol: str) -> str:
@@ -68,7 +374,15 @@ def main():
     # Sidebar navigation
     page = st.sidebar.selectbox(
         "Navigation",
-        ["Overview", "Calendar Heatmap", "Signal Detail", "Forward Calendar", "Methodology"],
+        ["Home", "Calendar Heatmap", "Signal Detail", "Forward Calendar", "Diagnostics", "Methodology"],
+    )
+
+    # Global toggle for showing internal codes
+    st.sidebar.markdown("---")
+    show_internal_codes = st.sidebar.checkbox(
+        "Show internal codes",
+        value=False,
+        help="Display internal signal codes (e.g., TDOM1, M12D26) alongside human-readable labels",
     )
 
     # Check database exists
@@ -87,35 +401,68 @@ def main():
     run_id = latest_run["run_id"]
     st.sidebar.info(f"Run ID: {run_id}")
 
-    # Add glossary to all pages except Methodology
-    if page != "Methodology":
+    # Add glossary to technical pages only (not Home, Methodology, or Diagnostics)
+    if page in ("Calendar Heatmap", "Signal Detail", "Forward Calendar"):
         render_glossary()
 
-    if page == "Overview":
-        render_overview(run_id)
+    if page == "Home":
+        render_home(run_id, show_internal_codes)
     elif page == "Calendar Heatmap":
         render_heatmap(run_id)
     elif page == "Signal Detail":
-        render_signal_detail(run_id)
+        render_signal_detail(run_id, show_internal_codes)
     elif page == "Forward Calendar":
-        render_forward_calendar(run_id)
+        render_forward_calendar(run_id, show_internal_codes)
+    elif page == "Diagnostics":
+        render_diagnostics(run_id)
     elif page == "Methodology":
         render_methodology()
 
 
-def render_overview(run_id: str):
-    """Render overview page."""
-    st.header("Overview")
+def compute_held_up_status(
+    train_wr: float,
+    train_baseline: float,
+    test_wr: float | None,
+    test_baseline: float | None,
+    test_n: int | None,
+) -> str:
+    """Compute held-up status: 'yes', 'unclear', 'no', or 'unknown'.
 
+    Returns:
+        String status for filtering and confidence mapping.
+    """
+    if test_wr is None or test_n is None or test_n == 0:
+        return "unknown"
+
+    test_delta = test_wr - (test_baseline or train_baseline)
+
+    if test_delta > 0 and test_n >= 30:
+        return "yes"
+    elif test_delta > 0 and test_n < 30:
+        return "unclear"
+    elif test_delta > -0.02:  # Within 2% of baseline
+        return "unclear"
+    else:
+        return "no"
+
+
+def render_home(run_id: str, show_internal_codes: bool = False):
+    """Render the Home/Briefing page with non-technical summary."""
+
+    # =========================================================================
+    # REPOSITORIES
+    # =========================================================================
     prices_repo = PricesRepo()
     returns_repo = ReturnsRepo()
     signals_repo = SignalsRepo()
 
     symbols = prices_repo.get_symbols()
 
-    # Symbol selector with friendly names
+    # =========================================================================
+    # ABOVE THE FOLD: Index selector + baseline
+    # =========================================================================
     selected_symbol = st.selectbox(
-        "Select Symbol",
+        "Select Index",
         symbols,
         format_func=format_symbol,
     )
@@ -124,68 +471,324 @@ def render_overview(run_id: str):
         st.warning("No symbols found in database.")
         return
 
-    # Baseline stats
-    st.subheader("Baseline Statistics")
+    short_name = SYMBOL_SHORT_NAMES.get(selected_symbol, selected_symbol)
 
+    # Get baseline data
     returns_df = returns_repo.get_returns(selected_symbol)
     train_returns = returns_df[returns_df["date"] <= TRAIN_END]
     test_returns = returns_df[returns_df["date"] >= TEST_START]
 
-    col1, col2, col3 = st.columns(3)
+    full_wr = returns_df["up"].mean()
+    train_wr = train_returns["up"].mean()
+    test_wr = test_returns["up"].mean()
+    train_baseline = train_wr
+    test_baseline = test_wr
 
-    with col1:
-        st.metric(
-            "Train Win Rate",
-            f"{train_returns['up'].mean():.2%}",
-            f"n={len(train_returns)}",
+    # One-sentence baseline
+    st.markdown(f"**{short_name.title()}** closes higher about **{full_wr:.0%}** of trading days.")
+
+    # Collapsed "How it works"
+    with st.expander("How it works", expanded=False):
+        st.markdown("""
+        1. **Discover** — Scan historical data for patterns that beat the baseline
+        2. **Verify** — Test those patterns on data they've never seen
+        3. **Filter** — Only show patterns that pass statistical controls
+
+        Patterns that work in discovery but fail in verification are marked "Did not hold" or "Unclear".
+        """)
+
+    # Baseline details (collapsed)
+    with st.expander("Baseline details"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Discovery period", f"{train_wr:.1%}", f"n={len(train_returns):,}")
+        with col2:
+            st.metric("Verification period", f"{test_wr:.1%}", f"n={len(test_returns):,}")
+        with col3:
+            st.metric("All time", f"{full_wr:.1%}", f"n={len(returns_df):,}")
+
+    st.markdown("---")
+
+    # =========================================================================
+    # GET SIGNALS AND COMPUTE HELD-UP STATUS
+    # =========================================================================
+    all_eligible = signals_repo.get_signal_stats(run_id, "train", eligible_only=True)
+    symbol_signals = all_eligible[all_eligible["symbol"] == selected_symbol]
+    test_stats = signals_repo.get_signal_stats(run_id, "test")
+
+    # Compute held-up status and cache test data for each signal
+    signal_data_map = {}  # signal_id -> {held_up, test_wr, test_n, train_wr, train_n}
+    held_up_counts = {"yes": 0, "unclear": 0, "no": 0, "unknown": 0}
+
+    for _, sig_row in symbol_signals.iterrows():
+        signal_id = sig_row["signal_id"]
+        train_signal_wr = float(sig_row["win_rate"])
+        train_n = int(sig_row["n"])
+
+        test_row = test_stats[test_stats["signal_id"] == signal_id]
+        if not test_row.empty:
+            test_row = test_row.iloc[0]
+            test_signal_wr = float(test_row["win_rate"])
+            test_signal_n = int(test_row["n"])
+        else:
+            test_signal_wr = None
+            test_signal_n = None
+
+        status = compute_held_up_status(
+            train_signal_wr, train_baseline,
+            test_signal_wr, test_baseline,
+            test_signal_n
         )
-    with col2:
-        st.metric(
-            "Test Win Rate",
-            f"{test_returns['up'].mean():.2%}",
-            f"n={len(test_returns)}",
+        held_up_counts[status] += 1
+
+        signal_data_map[signal_id] = {
+            "held_up": status,
+            "train_wr": train_signal_wr,
+            "train_n": train_n,
+            "test_wr": test_signal_wr,
+            "test_n": test_signal_n,
+        }
+
+    # Summary counts
+    patterns_found = len(symbol_signals)
+    held_up_count = held_up_counts["yes"]
+    unclear_count = held_up_counts["unclear"]
+
+    # Compact summary line
+    st.caption(
+        f"Found **{patterns_found}** patterns in discovery. "
+        f"**{held_up_count}** held up in verification, **{unclear_count}** unclear."
+    )
+
+    st.markdown("---")
+
+    # =========================================================================
+    # TOP VALIDATED PATTERNS (cards)
+    # =========================================================================
+    st.subheader("Top Validated Patterns")
+
+    # Filter options
+    col_filter, col_mode = st.columns([1, 1])
+    with col_filter:
+        include_unclear = st.checkbox("Include unclear", value=False)
+    with col_mode:
+        mode_filter = st.selectbox(
+            "Type",
+            ["All patterns", "Calendar dates only", "Trading days only"],
+            index=0,
+            label_visibility="collapsed",
         )
-    with col3:
-        st.metric(
-            "Full Win Rate",
-            f"{returns_df['up'].mean():.2%}",
-            f"n={len(returns_df)}",
-        )
 
-    # Top signals by family
-    st.subheader("Top 10 Signals by Family")
-    st.caption("Ranked by Train score; evaluated out-of-sample on Test.")
+    # Apply filters
+    display_statuses = ["yes"]
+    if include_unclear:
+        display_statuses.append("unclear")
 
-    for family in ["CDOY", "TDOM"]:
-        st.markdown(f"**{family}**")
+    patterns_to_show = []
+    for _, row in symbol_signals.iterrows():
+        signal_id = row["signal_id"]
+        sig_data = signal_data_map.get(signal_id, {})
 
-        top_df = signals_repo.get_top_signals(run_id, "train", 10, selected_symbol, family)
-
-        if top_df.empty:
-            st.info(f"No eligible {family} signals found.")
+        if sig_data.get("held_up") not in display_statuses:
             continue
 
-        # Format for display
-        display_df = []
-        for _, row in top_df.iterrows():
+        # Mode filter
+        family = row["family"]
+        if mode_filter == "Calendar dates only" and family != "CDOY":
+            continue
+        if mode_filter == "Trading days only" and family != "TDOM":
+            continue
+
+        patterns_to_show.append(row)
+
+    if not patterns_to_show:
+        st.info("No patterns held up for this index. Try including unclear patterns.")
+    else:
+        # Sort by score descending, take top 3
+        patterns_df = pd.DataFrame(patterns_to_show)
+        patterns_df = patterns_df.sort_values("score", ascending=False).head(3)
+
+        cols = st.columns(len(patterns_df))
+
+        for i, (_, row) in enumerate(patterns_df.iterrows()):
+            signal_id = row["signal_id"]
+            sig_data = signal_data_map[signal_id]
             key = json.loads(row["key_json"]) if isinstance(row["key_json"], str) else row["key_json"]
-            if family == "CDOY":
-                key_str = f"M{key.get('month'):02d}D{key.get('day'):02d}"
-            else:
-                key_str = f"TDOM{key.get('tdom')}"
+            family = row["family"]
+            direction = row["direction"]
 
-            display_df.append({
-                "Key": key_str,
-                "Direction": row["direction"],
-                "N": row["n"],
-                "Win Rate": f"{row['win_rate']:.2%}",
-                "Z-Score": f"{row['z_score']:.2f}" if row["z_score"] else "N/A",
-                "DCF": f"{row['decade_consistency']:.2f}" if row["decade_consistency"] else "N/A",
-                "FDR-Q": f"{row['fdr_q']:.3f}" if row["fdr_q"] else "N/A",
-                "Score": f"{row['score']:.2f}" if row["score"] else "N/A",
-            })
+            # Friendly labels
+            pattern_name = format_signal_key(family, key)
+            internal_code = get_internal_code(family, key)
+            direction_label = describe_direction(direction)
+            held_icon, held_label = get_held_up_label(sig_data["held_up"])
 
-        st.dataframe(pd.DataFrame(display_df), use_container_width=True)
+            # Stats
+            train_wr = sig_data["train_wr"]
+            train_n = sig_data["train_n"]
+            train_delta = train_wr - train_baseline
+            test_wr = sig_data["test_wr"]
+            test_n = sig_data["test_n"]
+            test_delta = (test_wr - test_baseline) if test_wr else None
+
+            with cols[i]:
+                # Card header
+                if show_internal_codes:
+                    st.markdown(f"**{pattern_name}** ({internal_code})")
+                else:
+                    st.markdown(f"**{pattern_name}**")
+                st.caption(direction_label)
+
+                # Stats
+                st.markdown(f"**Discovery:** {train_wr:.0%} ({train_delta:+.0%}) · n={train_n}")
+                if test_wr is not None:
+                    st.markdown(f"**Verification:** {test_wr:.0%} ({test_delta:+.0%}) · n={test_n}")
+                else:
+                    st.markdown("**Verification:** No data")
+
+                # Held up badge
+                st.markdown(f"{held_icon} **{held_label}**")
+
+                # View details button
+                if st.button("View details", key=f"card_{signal_id}"):
+                    st.session_state["selected_signal_id"] = signal_id
+                    st.info("Go to 'Signal Detail' page for full analysis.")
+
+    st.markdown("---")
+
+    # =========================================================================
+    # UPCOMING EVENTS
+    # =========================================================================
+    st.subheader("Upcoming Events")
+    st.caption("Dates where a discovered pattern applies. For research only.")
+
+    # Controls
+    col_days, col_failed = st.columns([1, 1])
+    with col_days:
+        days_ahead = st.radio("Show next", [30, 90], horizontal=True, index=0, label_visibility="collapsed")
+    with col_failed:
+        include_failed = st.checkbox("Include patterns that did not hold", value=False)
+
+    today = datetime.now().date()
+    end_date = today + timedelta(days=days_ahead)
+    future_keys = build_future_calendar_keys(today, end_date)
+
+    # Apply mode filter to signals for events
+    filtered_signals = symbol_signals.copy()
+    if mode_filter == "Calendar dates only":
+        filtered_signals = filtered_signals[filtered_signals["family"] == "CDOY"]
+    elif mode_filter == "Trading days only":
+        filtered_signals = filtered_signals[filtered_signals["family"] == "TDOM"]
+
+    if filtered_signals.empty or future_keys.empty:
+        st.info("No upcoming events in this period.")
+    else:
+        events = []
+
+        for _, key_row in future_keys.iterrows():
+            date_str = format_short_date(str(key_row["date"]))
+            month = int(key_row["month"])
+            day = int(key_row["day"])
+            tdom = int(key_row["tdom"])
+
+            for _, sig_row in filtered_signals.iterrows():
+                key = json.loads(sig_row["key_json"]) if isinstance(sig_row["key_json"], str) else sig_row["key_json"]
+                family = sig_row["family"]
+                matched = False
+
+                if family == "CDOY" and key.get("month") == month and key.get("day") == day:
+                    matched = True
+                elif family == "TDOM" and key.get("tdom") == tdom:
+                    matched = True
+
+                if matched:
+                    signal_id = sig_row["signal_id"]
+                    sig_data = signal_data_map.get(signal_id, {})
+                    held_status = sig_data.get("held_up", "unknown")
+
+                    # Filter based on held-up status
+                    if held_status in ("no", "unknown") and not include_failed:
+                        continue
+
+                    direction = sig_row["direction"]
+                    pattern_name = format_signal_key(family, key)
+                    internal_code = get_internal_code(family, key)
+                    held_icon, held_label = get_held_up_label(held_status)
+
+                    if show_internal_codes:
+                        pattern_display = f"{pattern_name} ({internal_code})"
+                    else:
+                        pattern_display = pattern_name
+
+                    events.append({
+                        "Date": date_str,
+                        "Pattern": pattern_display,
+                        "Direction": describe_direction(direction),
+                        "Status": f"{held_icon} {held_label}",
+                    })
+
+        if events:
+            events_df = pd.DataFrame(events).sort_values("Date")
+            st.dataframe(
+                events_df[["Date", "Pattern", "Direction", "Status"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption(f"{len(events)} events in the next {days_ahead} days.")
+        else:
+            st.info("No upcoming events in this period.")
+
+    st.markdown("---")
+
+    # =========================================================================
+    # ADVANCED: ALL SIGNALS (collapsed)
+    # =========================================================================
+    with st.expander("Advanced: All validated patterns"):
+        st.caption("Complete list of patterns that passed filters in discovery.")
+
+        # Re-fetch without mode filter for complete list
+        all_eligible_full = signals_repo.get_signal_stats(run_id, "train", eligible_only=True)
+        symbol_signals_full = all_eligible_full[all_eligible_full["symbol"] == selected_symbol]
+
+        for family_name, family_label in [("CDOY", "Calendar Dates"), ("TDOM", "Trading Days")]:
+            st.markdown(f"**{family_label}**")
+
+            family_signals = symbol_signals_full[symbol_signals_full["family"] == family_name]
+            family_signals = family_signals.sort_values("score", ascending=False).head(20)
+
+            if family_signals.empty:
+                st.info(f"No {family_label.lower()} patterns found.")
+                continue
+
+            display_list = []
+            for _, row in family_signals.iterrows():
+                signal_id = row["signal_id"]
+                key = json.loads(row["key_json"]) if isinstance(row["key_json"], str) else row["key_json"]
+                sig_data = signal_data_map.get(signal_id, {})
+
+                pattern_name = format_signal_key(family_name, key)
+                internal_code = get_internal_code(family_name, key)
+                direction = row["direction"]
+
+                if show_internal_codes:
+                    pattern_display = f"{pattern_name} ({internal_code})"
+                else:
+                    pattern_display = pattern_name
+
+                train_wr = sig_data.get("train_wr", row["win_rate"])
+                test_wr = sig_data.get("test_wr")
+                held_status = sig_data.get("held_up", "unknown")
+                held_icon, held_label = get_held_up_label(held_status)
+
+                display_list.append({
+                    "Pattern": pattern_display,
+                    "Direction": describe_direction(direction),
+                    "Discovery": f"{train_wr:.0%}",
+                    "Verification": f"{test_wr:.0%}" if test_wr else "—",
+                    "Status": f"{held_icon} {held_label}",
+                })
+
+            st.dataframe(pd.DataFrame(display_list), use_container_width=True, hide_index=True)
 
 
 def render_heatmap(run_id: str):
@@ -336,16 +939,17 @@ def render_heatmap(run_id: str):
         st.metric("Eligible Signals", len(eligible_signals))
 
 
-def render_signal_detail(run_id: str):
+def render_signal_detail(run_id: str, show_internal_codes: bool = False):
     """Render signal detail page."""
-    st.header("Signal Detail")
+    st.header("Pattern Details")
 
     signals_repo = SignalsRepo()
     prices_repo = PricesRepo()
+    returns_repo = ReturnsRepo()
 
     symbols = prices_repo.get_symbols()
     selected_symbol = st.selectbox(
-        "Select Symbol",
+        "Select Index",
         symbols,
         format_func=format_symbol,
     )
@@ -353,31 +957,45 @@ def render_signal_detail(run_id: str):
     if not selected_symbol:
         return
 
+    # Get baseline for context
+    returns_df = returns_repo.get_returns(selected_symbol)
+    train_returns = returns_df[returns_df["date"] <= TRAIN_END]
+    test_returns = returns_df[returns_df["date"] >= TEST_START]
+    train_baseline_wr = train_returns["up"].mean()
+    test_baseline_wr = test_returns["up"].mean()
+    train_baseline_ret = train_returns["ret_cc"].mean() if "ret_cc" in train_returns.columns else None
+    test_baseline_ret = test_returns["ret_cc"].mean() if "ret_cc" in test_returns.columns else None
+
     # Get all signals for symbol
     all_signals = signals_repo.get_signal_stats(run_id, "train")
     symbol_signals = all_signals[all_signals["symbol"] == selected_symbol]
 
     if symbol_signals.empty:
-        st.warning("No signals found for this symbol.")
+        st.warning("No patterns found for this index.")
         return
 
-    # Build signal options
+    # Build signal options using formatters
     signal_options = []
     for _, row in symbol_signals.iterrows():
         key = json.loads(row["key_json"]) if isinstance(row["key_json"], str) else row["key_json"]
         family = row["family"]
-        if family == "CDOY":
-            key_str = f"M{key.get('month'):02d}D{key.get('day'):02d}"
+        pattern_name = format_signal_key(family, key)
+        internal_code = get_internal_code(family, key)
+        direction = row["direction"]
+        direction_label = describe_direction(direction)
+
+        if show_internal_codes:
+            base_label = f"{pattern_name} ({internal_code}) - {direction_label}"
         else:
-            key_str = f"TDOM{key.get('tdom')}"
-        label = f"{family} {key_str} ({row['direction']}) - Score: {row['score']:.2f}" if row['score'] else f"{family} {key_str} ({row['direction']})"
-        signal_options.append((row["signal_id"], label))
+            base_label = f"{pattern_name} - {direction_label}"
+
+        signal_options.append((row["signal_id"], base_label, row.get("score", 0) or 0))
 
     # Sort by score
-    signal_options.sort(key=lambda x: float(x[1].split("Score: ")[1]) if "Score:" in x[1] else 0, reverse=True)
+    signal_options.sort(key=lambda x: x[2], reverse=True)
 
     selected_signal = st.selectbox(
-        "Select Signal",
+        "Select Pattern",
         options=[s[0] for s in signal_options],
         format_func=lambda x: next(s[1] for s in signal_options if s[0] == x),
     )
@@ -388,102 +1006,161 @@ def render_signal_detail(run_id: str):
     # Get all window stats for this signal
     signal_data = all_signals[all_signals["signal_id"] == selected_signal].iloc[0]
 
-    st.subheader("Signal Information")
-
     key = json.loads(signal_data["key_json"]) if isinstance(signal_data["key_json"], str) else signal_data["key_json"]
     family = signal_data["family"]
-    if family == "CDOY":
-        key_str = f"Month {key.get('month')}, Day {key.get('day')}"
+    direction = signal_data["direction"]
+
+    # Friendly labels
+    pattern_name = format_signal_key(family, key)
+    internal_code = get_internal_code(family, key)
+    direction_label = describe_direction(direction)
+    pattern_description = get_pattern_description(family, key, direction)
+
+    # Header with pattern info
+    st.markdown("---")
+    if show_internal_codes:
+        st.subheader(f"{pattern_name} ({internal_code})")
     else:
-        key_str = f"Trading Day {key.get('tdom')} of Month"
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Family", family)
-    with col2:
-        st.metric("Key", key_str)
-    with col3:
-        st.metric("Direction", signal_data["direction"])
-
-    # Train vs Test comparison with clear labels
-    st.subheader("Performance by Window")
+        st.subheader(pattern_name)
+    st.markdown(f"**{direction_label}** — {pattern_description}")
 
     # Get test stats
     test_stats = signals_repo.get_signal_stats(run_id, "test")
     test_row = test_stats[test_stats["signal_id"] == selected_signal]
 
-    full_stats = signals_repo.get_signal_stats(run_id, "full")
-    full_row = full_stats[full_stats["signal_id"] == selected_signal]
-
-    comparison_data = []
-
-    # Train
-    comparison_data.append({
-        "Window": "Train (discovery)",
-        "N": signal_data["n"],
-        "Wins": signal_data["wins"],
-        "Win Rate": f"{signal_data['win_rate']:.2%}",
-        "Avg Return": f"{signal_data['avg_ret']:.4%}" if signal_data['avg_ret'] else "N/A",
-        "CI": f"[{signal_data['ci_low']:.2f}-{signal_data['ci_high']:.2f}]" if signal_data['ci_low'] else "N/A",
-        "Z-Score": f"{signal_data['z_score']:.2f}" if signal_data['z_score'] else "N/A",
-        "DCF": f"{signal_data['decade_consistency']:.2f}" if signal_data['decade_consistency'] else "N/A",
-        "FDR-Q": f"{signal_data['fdr_q']:.3f}" if signal_data['fdr_q'] else "N/A",
-        "Score": f"{signal_data['score']:.2f}" if signal_data['score'] else "N/A",
-    })
-
-    # Test
+    # Compute held-up status
+    train_wr = float(signal_data["win_rate"])
+    train_n = int(signal_data["n"])
     if not test_row.empty:
         test_data = test_row.iloc[0]
-        comparison_data.append({
-            "Window": "Test (holdout)",
-            "N": test_data["n"],
-            "Wins": test_data["wins"],
-            "Win Rate": f"{test_data['win_rate']:.2%}",
-            "Avg Return": f"{test_data['avg_ret']:.4%}" if test_data['avg_ret'] else "N/A",
-            "CI": f"[{test_data['ci_low']:.2f}-{test_data['ci_high']:.2f}]" if test_data['ci_low'] else "N/A",
-            "Z-Score": "-",
-            "DCF": "-",
-            "FDR-Q": "-",
-            "Score": "-",
-        })
+        test_wr = float(test_data["win_rate"])
+        test_n = int(test_data["n"])
+        test_avg_ret = test_data.get("avg_ret")
+    else:
+        test_wr = None
+        test_n = None
+        test_avg_ret = None
 
-    # Full
-    if not full_row.empty:
-        full_data = full_row.iloc[0]
-        comparison_data.append({
-            "Window": "Full (context)",
-            "N": full_data["n"],
-            "Wins": full_data["wins"],
-            "Win Rate": f"{full_data['win_rate']:.2%}",
-            "Avg Return": f"{full_data['avg_ret']:.4%}" if full_data['avg_ret'] else "N/A",
-            "CI": f"[{full_data['ci_low']:.2f}-{full_data['ci_high']:.2f}]" if full_data['ci_low'] else "N/A",
-            "Z-Score": "-",
-            "DCF": "-",
-            "FDR-Q": "-",
-            "Score": "-",
-        })
+    held_status = compute_held_up_status(train_wr, train_baseline_wr, test_wr, test_baseline_wr, test_n)
+    held_icon, held_label = get_held_up_label(held_status)
 
-    st.dataframe(pd.DataFrame(comparison_data), use_container_width=True)
+    # Main performance cards
+    st.markdown("### Performance Summary")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.markdown("**Discovery Period**")
+        train_delta = train_wr - train_baseline_wr
+        st.metric("Hit Rate", f"{train_wr:.1%}", f"{train_delta:+.1%} vs baseline")
+        st.caption(f"n = {train_n} days")
+
+        # Show avg return if available
+        train_avg_ret = signal_data.get("avg_ret")
+        if train_avg_ret and train_baseline_ret:
+            ret_bps = train_avg_ret * 10000
+            baseline_bps = train_baseline_ret * 10000
+            st.caption(f"Avg return: {ret_bps:+.1f} bps (baseline: {baseline_bps:+.1f} bps)")
+
+    with col2:
+        st.markdown("**Verification Period**")
+        if test_wr is not None:
+            test_delta = test_wr - test_baseline_wr
+            st.metric("Hit Rate", f"{test_wr:.1%}", f"{test_delta:+.1%} vs baseline")
+            st.caption(f"n = {test_n} days")
+
+            if test_avg_ret and test_baseline_ret:
+                ret_bps = test_avg_ret * 10000
+                baseline_bps = test_baseline_ret * 10000
+                st.caption(f"Avg return: {ret_bps:+.1f} bps (baseline: {baseline_bps:+.1f} bps)")
+        else:
+            st.metric("Hit Rate", "—")
+            st.caption("No data available")
+
+    with col3:
+        st.markdown("**Held Up?**")
+        st.markdown(f"### {held_icon} {held_label}")
+        if held_status == "yes":
+            st.caption("Pattern persisted in verification data")
+        elif held_status == "unclear":
+            st.caption("Results inconclusive (small sample or near baseline)")
+        elif held_status == "no":
+            st.caption("Pattern did not persist in verification")
+        else:
+            st.caption("Insufficient verification data")
 
     # Eligibility status
+    st.markdown("---")
     if signal_data["eligible"]:
-        st.success(f"This signal passes eligibility criteria (n >= {MIN_N}, FDR-Q <= {FDR_THRESHOLD:.0%})")
+        st.success("✓ This pattern passed statistical filters in discovery")
     else:
-        st.warning(f"This signal does not pass eligibility criteria (requires n >= {MIN_N} and FDR-Q <= {FDR_THRESHOLD:.0%})")
+        st.warning("This pattern did not pass statistical filters")
+
+    # Advanced stats (collapsed)
+    with st.expander("Advanced: Statistical Details"):
+        st.caption("Technical metrics from the discovery period.")
+
+        # Get full stats
+        full_stats = signals_repo.get_signal_stats(run_id, "full")
+        full_row = full_stats[full_stats["signal_id"] == selected_signal]
+
+        comparison_data = []
+
+        # Discovery
+        comparison_data.append({
+            "Period": "Discovery",
+            "N": signal_data["n"],
+            "Wins": signal_data["wins"],
+            "Hit Rate": f"{signal_data['win_rate']:.2%}",
+            "Avg Return": f"{signal_data['avg_ret']:.4%}" if signal_data['avg_ret'] else "—",
+            "Z-Score": f"{signal_data['z_score']:.2f}" if signal_data['z_score'] else "—",
+            "Decade Consistency": f"{signal_data['decade_consistency']:.2f}" if signal_data['decade_consistency'] else "—",
+            "FDR-Q": f"{signal_data['fdr_q']:.3f}" if signal_data['fdr_q'] else "—",
+        })
+
+        # Verification
+        if not test_row.empty:
+            comparison_data.append({
+                "Period": "Verification",
+                "N": test_data["n"],
+                "Wins": test_data["wins"],
+                "Hit Rate": f"{test_data['win_rate']:.2%}",
+                "Avg Return": f"{test_data['avg_ret']:.4%}" if test_data['avg_ret'] else "—",
+                "Z-Score": "—",
+                "Decade Consistency": "—",
+                "FDR-Q": "—",
+            })
+
+        # Full
+        if not full_row.empty:
+            full_data = full_row.iloc[0]
+            comparison_data.append({
+                "Period": "All Time",
+                "N": full_data["n"],
+                "Wins": full_data["wins"],
+                "Hit Rate": f"{full_data['win_rate']:.2%}",
+                "Avg Return": f"{full_data['avg_ret']:.4%}" if full_data['avg_ret'] else "—",
+                "Z-Score": "—",
+                "Decade Consistency": "—",
+                "FDR-Q": "—",
+            })
+
+        st.dataframe(pd.DataFrame(comparison_data), use_container_width=True, hide_index=True)
 
 
-def render_forward_calendar(run_id: str):
+def render_forward_calendar(run_id: str, show_internal_codes: bool = False):
     """Render forward calendar page.
 
     Shows upcoming dates where eligible signals fire.
     Includes BOTH CDOY and TDOM signals.
     Uses NYSE trading calendar (exchange-calendars) for accurate session dates.
     """
-    st.header("Forward Calendar")
-    st.caption("Upcoming trading sessions where eligible Train signals fire. Uses NYSE calendar (holidays excluded).")
+    st.header("Upcoming Pattern Dates")
+    st.caption("Trading sessions where discovered patterns apply. For research only.")
 
     signals_repo = SignalsRepo()
     prices_repo = PricesRepo()
+    returns_repo = ReturnsRepo()
 
     symbols = prices_repo.get_symbols()
 
@@ -491,39 +1168,59 @@ def render_forward_calendar(run_id: str):
     col1, col2 = st.columns(2)
     with col1:
         selected_symbols = st.multiselect(
-            "Symbols",
+            "Indices",
             symbols,
             default=symbols,
             format_func=format_symbol,
         )
     with col2:
-        num_days = st.slider("Calendar Days Ahead", 30, 180, 60)
+        num_days = st.slider("Days Ahead", 30, 180, 60)
 
     if not selected_symbols:
-        st.warning("Please select at least one symbol.")
+        st.warning("Please select at least one index.")
         return
 
-    # Get eligible signals from Train window
+    # Get eligible signals from discovery window
     all_signals = signals_repo.get_signal_stats(run_id, "train", eligible_only=True)
 
     if all_signals.empty:
-        st.warning("No eligible signals found in the Train window.")
+        st.warning("No validated patterns found.")
         return
 
     # Filter by selected symbols
     filtered_signals = all_signals[all_signals["symbol"].isin(selected_symbols)]
 
     if filtered_signals.empty:
-        st.warning("No eligible signals for selected symbols.")
+        st.warning("No validated patterns for selected indices.")
         return
 
-    # Get test stats for comparison
+    # Get test stats and compute held-up status for each signal
     test_stats = signals_repo.get_signal_stats(run_id, "test")
 
-    # Build a map of signal_id -> test win_rate
-    test_wr_map = {}
-    for _, row in test_stats.iterrows():
-        test_wr_map[row["signal_id"]] = row["win_rate"]
+    signal_status_map = {}  # signal_id -> held_up status
+    for _, sig_row in filtered_signals.iterrows():
+        signal_id = sig_row["signal_id"]
+        symbol = sig_row["symbol"]
+
+        # Get baseline for this symbol
+        returns_df = returns_repo.get_returns(symbol)
+        train_returns = returns_df[returns_df["date"] <= TRAIN_END]
+        test_returns = returns_df[returns_df["date"] >= TEST_START]
+        train_baseline = train_returns["up"].mean()
+        test_baseline = test_returns["up"].mean()
+
+        train_wr = float(sig_row["win_rate"])
+        test_row = test_stats[test_stats["signal_id"] == signal_id]
+
+        if not test_row.empty:
+            test_wr = float(test_row.iloc[0]["win_rate"])
+            test_n = int(test_row.iloc[0]["n"])
+        else:
+            test_wr = None
+            test_n = None
+
+        status = compute_held_up_status(train_wr, train_baseline, test_wr, test_baseline, test_n)
+        signal_status_map[signal_id] = status
 
     # Build future calendar keys using NYSE trading calendar
     today = datetime.now().date()
@@ -537,14 +1234,12 @@ def render_forward_calendar(run_id: str):
 
     # Build forward calendar data
     calendar_data = []
-    dow_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
     for _, key_row in future_keys.iterrows():
-        date_str = key_row["date"]
+        date_str = format_short_date(str(key_row["date"]))
         month = int(key_row["month"])
         day = int(key_row["day"])
         tdom = int(key_row["tdom"])
-        dow = dow_names[int(key_row["dow"])]
 
         # Check each symbol's signals
         for symbol in selected_symbols:
@@ -555,54 +1250,154 @@ def render_forward_calendar(run_id: str):
                 family = sig_row["family"]
                 matched = False
 
-                if family == "CDOY":
-                    if key.get("month") == month and key.get("day") == day:
-                        matched = True
-                        signal_name = f"M{month:02d}D{day:02d}"
-                elif family == "TDOM":
-                    if key.get("tdom") == tdom:
-                        matched = True
-                        signal_name = f"TDOM{tdom}"
+                if family == "CDOY" and key.get("month") == month and key.get("day") == day:
+                    matched = True
+                elif family == "TDOM" and key.get("tdom") == tdom:
+                    matched = True
 
                 if matched:
-                    # Get test win rate if available
-                    test_wr = test_wr_map.get(sig_row["signal_id"])
-                    test_wr_str = f"{test_wr:.2%}" if test_wr is not None else "-"
+                    signal_id = sig_row["signal_id"]
+
+                    # Use formatters for signal display
+                    pattern_name = format_signal_key(family, key)
+                    internal_code = get_internal_code(family, key)
+                    direction = sig_row["direction"]
+
+                    if show_internal_codes:
+                        signal_display = f"{pattern_name} ({internal_code})"
+                    else:
+                        signal_display = pattern_name
+
+                    # Get held-up status
+                    held_status = signal_status_map.get(signal_id, "unknown")
+                    held_icon, held_label = get_held_up_label(held_status)
 
                     calendar_data.append({
                         "Date": date_str,
-                        "DOW": dow,
-                        "Symbol": format_symbol(symbol),
-                        "Family": family,
-                        "Signal": signal_name,
-                        "Direction": sig_row["direction"],
-                        "Train WR": f"{sig_row['win_rate']:.2%}",
-                        "Test WR": test_wr_str,
-                        "FDR-Q": f"{sig_row['fdr_q']:.3f}" if sig_row['fdr_q'] else "-",
-                        "Score": f"{sig_row['score']:.2f}" if sig_row['score'] else "-",
+                        "Index": SYMBOL_SHORT_NAMES.get(symbol, symbol),
+                        "Pattern": signal_display,
+                        "Direction": describe_direction(direction),
+                        "Status": f"{held_icon} {held_label}",
                     })
 
     if calendar_data:
         # Sort by date
         calendar_df = pd.DataFrame(calendar_data)
         calendar_df = calendar_df.sort_values("Date")
-        st.dataframe(calendar_df, use_container_width=True, height=600)
+        st.dataframe(calendar_df, use_container_width=True, hide_index=True, height=500)
 
-        # Summary stats
-        st.markdown("---")
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Trading Sessions", len(future_keys))
-        with col2:
-            st.metric("Total Signal Events", len(calendar_data))
-        with col3:
-            cdoy_count = len([c for c in calendar_data if c["Family"] == "CDOY"])
-            st.metric("CDOY Events", cdoy_count)
-        with col4:
-            tdom_count = len([c for c in calendar_data if c["Family"] == "TDOM"])
-            st.metric("TDOM Events", tdom_count)
+        st.caption(f"{len(calendar_data)} pattern events across {len(future_keys)} trading sessions.")
     else:
-        st.info("No eligible signals fire in the selected date range.")
+        st.info("No pattern events in the selected date range.")
+
+
+def render_diagnostics(run_id: str):
+    """Render diagnostics page showing validation check results."""
+    st.header("Diagnostics")
+    st.caption("Validation checks for data integrity and calendar correctness.")
+
+    with st.spinner("Running validation checks..."):
+        results = run_all_checks(run_id)
+
+    # Count by status using helper function for compatibility
+    passed = sum(1 for r in results if get_check_status(r) == "pass")
+    warned = sum(1 for r in results if get_check_status(r) in ("warn", "skip"))
+    failed = sum(1 for r in results if get_check_status(r) == "fail")
+    total = len(results)
+
+    # Summary metrics
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Total Checks", total)
+    with col2:
+        st.metric("Passed", passed)
+    with col3:
+        if warned > 0:
+            st.metric("Warnings", warned)
+        else:
+            st.metric("Warnings", 0)
+    with col4:
+        if failed > 0:
+            st.metric("Failed", failed, delta=f"-{failed}", delta_color="inverse")
+        else:
+            st.metric("Failed", 0)
+
+    # Overall status
+    if failed == 0 and warned == 0:
+        st.success("All validation checks passed.")
+    elif failed == 0:
+        st.warning(f"All checks passed, but {warned} warning(s). See details below.")
+    else:
+        st.error(f"{failed} check(s) failed. See details below.")
+
+    st.markdown("---")
+
+    # Group results by category
+    categories = {}
+    for r in results:
+        name = get_check_name(r)
+        category = name.split("_")[0]
+        if category not in categories:
+            categories[category] = []
+        categories[category].append(r)
+
+    # Category descriptions
+    category_info = {
+        "data": ("Data Coverage", "Checks price and returns data counts and date ranges for each symbol."),
+        "no": ("Trading Calendar", "Verifies NYSE trading calendar excludes weekends."),
+        "jan1": ("Holiday Exclusion", "Confirms Jan 1, 2026 (holiday) is excluded from sessions."),
+        "tdom1": ("TDOM1 Correctness", "Verifies TDOM1 Jan 2026 = Jan 2 (first trading day after holiday)."),
+        "tdom2": ("TDOM2 Correctness", "Verifies TDOM2 Jan 2026 = Jan 5 (second trading day)."),
+        "heatmap": ("Heatmap Sanity", "Checks each symbol has sufficient month/day cells with n >= 20."),
+        "signal": ("Signal Detail", "Validates top signal train/test/full statistics consistency."),
+        "forward": ("Forward Coverage", "Shows eligible signals and upcoming calendar matches."),
+    }
+
+    # Status display: icon + label
+    status_display = {
+        "pass": ("✅", "PASS"),
+        "fail": ("❌", "FAIL"),
+        "warn": ("⚠️", "WARN"),
+        "skip": ("⏭️", "SKIP"),
+    }
+
+    for category, check_results in categories.items():
+        title, desc = category_info.get(category, (category.upper(), ""))
+
+        # Expand if any failures or warnings
+        has_issues = any(get_check_status(r) in ("fail", "warn", "skip") for r in check_results)
+
+        with st.expander(f"{title} ({len(check_results)} checks)", expanded=has_issues):
+            if desc:
+                st.caption(desc)
+
+            for r in check_results:
+                status = get_check_status(r)
+                name = get_check_name(r)
+                message = get_check_message(r)
+                details = get_check_details(r)
+
+                icon, label = status_display.get(status, ("❓", status.upper()))
+                st.markdown(f"{icon} **[{label}]** {name}: {message}")
+
+                # Show details if available
+                if details:
+                    with st.container():
+                        detail_cols = st.columns(min(len(details), 4))
+                        items = list(details.items())
+                        for i, (key, value) in enumerate(items[:4]):
+                            with detail_cols[i]:
+                                if isinstance(value, float):
+                                    st.metric(key, f"{value:.4f}")
+                                elif isinstance(value, list):
+                                    st.metric(key, ", ".join(str(v) for v in value[:3]) or "None")
+                                else:
+                                    st.metric(key, str(value))
+
+    # Re-run button
+    st.markdown("---")
+    if st.button("Re-run Validation Checks"):
+        st.rerun()
 
 
 def render_methodology():

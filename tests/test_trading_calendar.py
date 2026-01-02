@@ -145,6 +145,16 @@ class TestTDOMAccuracy:
         expected = list(range(1, len(tdom_values) + 1))
         assert tdom_values == expected, f"TDOM should be sequential: got {tdom_values}"
 
+    def test_tdom2_is_second_trading_day(self):
+        """TDOM2 should be the 2nd trading day of the month (Jan 5, 2026)."""
+        keys = build_future_calendar_keys(date(2026, 1, 1), date(2026, 1, 15))
+
+        jan_keys = keys[keys["month"] == 1]
+        tdom2_row = jan_keys[jan_keys["tdom"] == 2].iloc[0]
+
+        # Jan 1 = holiday, Jan 2 = TDOM1 (Friday), Jan 3-4 = weekend, Jan 5 = TDOM2 (Monday)
+        assert tdom2_row["date"] == "2026-01-05", f"TDOM2 should be Jan 5, got {tdom2_row['date']}"
+
     def test_tdom10_is_tenth_trading_day(self):
         """TDOM10 should be the 10th trading day of the month."""
         keys = build_future_calendar_keys(date(2026, 1, 1), date(2026, 1, 31))
